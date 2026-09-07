@@ -1,0 +1,180 @@
+name: Build CS Client iOS IPA (Cstrike + Czero)
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+env:
+  SDL_VERSION: 2.32.10
+  # Customize these for your own app identity:
+  APP_DISPLAY_NAME: "CS Client"
+  APP_BUNDLE_ID: "com.muntazirfx.csclient"
+
+jobs:
+  # ---------------------------------------------------------
+  # JOB 1: Build the engine for iOS (arm64)
+  # ---------------------------------------------------------
+  build-engine-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout xash3d-fwgs
+        uses: actions/checkout@v4
+        with:
+          repository: FWGS/xash3d-fwgs
+          submodules: recursive
+          path: engine
+
+      - name: Build SDL2 xcframework for iOS
+        run: |
+          git clone https://github.com/libsdl-org/SDL -b "release-${SDL_VERSION}"
+          cd SDL/Xcode/SDL
+          xcodebuild -scheme xcFramework-iOS -target xcFramework-iOS build -configuration Release
+          sudo cp -vr Products/SDL2.xcframework/ios-arm64/SDL2.framework /Library/Frameworks
+
+      - name: Configure & build engine (waf, iOS target)
+        working-directory: engine
+        run: |
+          ./waf configure --enable-lto --ios build install --destdir=build/ios
+          cp -vr /Library/Frameworks/SDL2.framework ./build
+
+      - name: Upload engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-ios-arm64
+          path: |
+            engine/build/ios
+            engine/build/SDL2.framework
+            engine/engine/platform/ios/bundle
+
+  # ---------------------------------------------------------
+  # JOB 2: Build cstrike + czero for iOS (matrix)
+  # Both come from the SAME cs16-client source. CZero is not a
+  # separate codebase - the client detects it at runtime via
+  # GetGameType()==GAME_CZERO, so we just build the same source
+  # twice with a different -DGAME_DIR override so CMake installs
+  # each copy into the right gamedir folder name.
+  # EXPERIMENTAL: cs16-client has no official iOS CMake preset -
+  # this reuses the generic CMAKE_SYSTEM_NAME=iOS approach that
+  # worked for hlsdk-portable, but is unverified for this repo.
+  # ---------------------------------------------------------
+  build-games-ios:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gamedir: cstrike
+          - gamedir: czero
+    steps:
+      - name: Checkout Velaron/cs16-client (main)
+        uses: actions/checkout@v4
+        with:
+          repository: Velaron/cs16-client
+          ref: main
+          submodules: recursive
+          path: gamesrc
+
+      - name: Configure (CMake, iOS target)
+        working-directory: gamesrc
+        run: |
+          # NOTE on install prefix: do NOT append ${{ matrix.gamedir }} here -
+          # cs16-client's own install() rules already install to
+          # "${GAME_DIR}/dlls/..." and "${GAME_DIR}/cl_dlls/..." relative to
+          # CMAKE_INSTALL_PREFIX. Appending it again here would double-nest
+          # the folder (dist/cstrike/cstrike/...) exactly like the
+          # hlsdk-portable bug we hit earlier.
+          #
+          # GAME_DIR is a CMake cache variable (default "cstrike") that
+          # controls BOTH the install subfolder name AND which gamedir the
+          # engine will treat this build as - overriding it to "czero"
+          # here builds the identical source but installs it under czero/.
+          cmake -DCMAKE_SYSTEM_NAME=iOS \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+                -DCMAKE_INSTALL_PREFIX="$(pwd)/../dist" \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DGAME_DIR="${{ matrix.gamedir }}" \
+                -B build -S .
+
+      - name: Build & install
+        working-directory: gamesrc
+        run: cmake --build build --target install
+
+      - name: Upload game artifact (own gamedir folder - avoids client.dylib clash)
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-ios-${{ matrix.gamedir }}
+          path: dist/${{ matrix.gamedir }}
+
+  # ---------------------------------------------------------
+  # JOB 3: Assemble app bundle (engine + cstrike + czero),
+  # rebrand Info.plist to the custom app name/bundle ID, sign,
+  # and zip the final .ipa
+  # ---------------------------------------------------------
+  package-ipa:
+    needs: [ build-engine-ios, build-games-ios ]
+    runs-on: macos-latest
+    steps:
+      - name: Download engine artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-ios-arm64
+          path: engineart
+
+      - name: Download cstrike
+        uses: actions/download-artifact@v4
+        with: { name: game-ios-cstrike, path: games/cstrike }
+      - name: Download czero
+        uses: actions/download-artifact@v4
+        with: { name: game-ios-czero,   path: games/czero }
+
+      - name: Assemble xash3d.app bundle
+        run: |
+          set -e
+          APP=payload_root/Payload/xash3d.app
+          mkdir -p "$APP"
+
+          # Engine binaries (waf destdir layout: engineart/build/ios/*)
+          cp -r engineart/build/ios/* "$APP/"
+
+          # App metadata + frameworks
+          cp engineart/engine/platform/ios/bundle/Info.plist "$APP/"
+          cp -r engineart/build/SDL2.framework "$APP/"
+
+          # Each game keeps its own subfolder -> no client.dylib clash
+          for g in cstrike czero; do
+            mkdir -p "$APP/$g"
+            cp -r "games/$g/"* "$APP/$g/"
+          done
+
+          echo "Final bundle layout:"
+          find "$APP" -maxdepth 2
+
+      - name: Rebrand Info.plist (app name + bundle ID)
+        run: |
+          APP=payload_root/Payload/xash3d.app
+          PLIST="$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${APP_DISPLAY_NAME}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${APP_DISPLAY_NAME}" "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${APP_DISPLAY_NAME}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${APP_BUNDLE_ID}" "$PLIST"
+          echo "Final Info.plist identity:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST"
+
+      - name: Ad-hoc codesign
+        run: |
+          codesign --entitlements engineart/engine/platform/ios/bundle/entitlements.plist \
+                    --sign "-" --force payload_root/Payload/xash3d.app
+
+      - name: Create IPA
+        run: |
+          cd payload_root
+          zip -q -r ../CSClient-ios-arm64.ipa Payload
+
+      - name: Upload final IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CSClient-ios-arm64
+          path: CSClient-ios-arm64.ipa
