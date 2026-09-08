@@ -89,11 +89,19 @@ jobs:
           # controls BOTH the install subfolder name AND which gamedir the
           # engine will treat this build as - overriding it to "czero"
           # here builds the identical source but installs it under czero/.
+          #
+          # MAINUI_USE_STB=ON: 3rdparty/mainui_cpp's default font backend
+          # is system FreeType (via find_package(Freetype)), which isn't
+          # available when cross-compiling for iOS ("Could NOT find
+          # Freetype"). mainui_cpp also supports stb_truetype as a
+          # bundled, dependency-free alternative - this is the same fix
+          # cs16-client's own PS Vita preset uses for the same reason.
           cmake -DCMAKE_SYSTEM_NAME=iOS \
                 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
                 -DCMAKE_INSTALL_PREFIX="$(pwd)/../dist" \
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DGAME_DIR="${{ matrix.gamedir }}" \
+                -DMAINUI_USE_STB=ON \
                 -B build -S .
 
       - name: Build & install
